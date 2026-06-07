@@ -1,0 +1,18 @@
+CompileFlags:
+  CompilationDatabase: build
+  Add:
+    # путь к скомпилированным PCM файлам для резолва import
+    - -fprebuilt-module-path=/home/andrey/Документы/Cyton/Project/build/CMakeFiles/cyton.dir
+
+---
+# для .cppm файлов — явно указываем что это module interface unit
+If:
+  PathMatch: .*\.cppm$
+CompileFlags:
+  Add:
+    - -x
+    - c++-module
+    - -fprebuilt-module-path=/home/andrey/Документы/Cyton/Project/build/CMakeFiles/cyton.dir
+
+Index:
+  Background: Build
