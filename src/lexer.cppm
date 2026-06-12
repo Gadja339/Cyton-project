@@ -28,6 +28,7 @@ private:
 
     void skip_spaces();
     void skip_comment();
+    void skip_block_comment();
 
     Token make_token(TokenKind kind, std::size_t start_pos,
                      std::size_t start_line, std::size_t start_column) const;

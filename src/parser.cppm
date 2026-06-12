@@ -46,11 +46,16 @@ private:
 
     // Выражения (по уровням приоритета)
     std::unique_ptr<Expr> parse_expr();
+    std::unique_ptr<Expr> parse_pipeline();
     std::unique_ptr<Expr> parse_cast();
     std::unique_ptr<Expr> parse_logical_or();
     std::unique_ptr<Expr> parse_logical_and();
+    std::unique_ptr<Expr> parse_bitwise_or();
+    std::unique_ptr<Expr> parse_bitwise_xor();
+    std::unique_ptr<Expr> parse_bitwise_and();
     std::unique_ptr<Expr> parse_equality();
     std::unique_ptr<Expr> parse_comparison();
+    std::unique_ptr<Expr> parse_shift();
     std::unique_ptr<Expr> parse_term();
     std::unique_ptr<Expr> parse_factor();
     std::unique_ptr<Expr> parse_unary();

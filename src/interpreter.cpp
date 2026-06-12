@@ -129,15 +129,16 @@ bool Interpreter::define_var(
     auto& scope = scopes_.back();
 
     if (scope.find(name) != scope.end()) {
+        // В REPL-режиме разрешаем переопределение переменных в глобальном скоупе
+        if (repl_mode_ && scopes_.size() == 1) {
+            scope[name] = RuntimeVar{deep_copy(value), is_mutable};
+            return true;
+        }
         runtime_error(loc, "variable '" + name + "' is already defined");
         return false;
     }
 
-    scope[name] = RuntimeVar{
-        deep_copy(value),
-        is_mutable
-    };
-
+    scope[name] = RuntimeVar{deep_copy(value), is_mutable};
     return true;
 }
 
@@ -176,22 +177,46 @@ Interpreter::Value Interpreter::deep_copy(const Value& val) {
     return val;
 }
 
+// ── REPL: инициализация и пошаговое выполнение ───────────────────────────────
+
+void Interpreter::init_repl() {
+    had_runtime_error_ = false;
+    stopped_           = false;
+    exit_code_         = 0;
+    repl_mode_         = true;
+    scopes_.clear();
+    functions_.clear();
+    begin_scope();  // глобальный скоуп остаётся открытым на всю сессию
+}
+
+int Interpreter::exec_chunk(const Program& program) {
+    had_runtime_error_ = false;
+    stopped_           = false;
+
+    collect_functions(program);  // регистрируем новые функции
+
+    for (const TopItem& item : program.items) {
+        exec_top_item(item);
+        if (had_runtime_error_ || stopped_) break;
+    }
+
+    return had_runtime_error_ ? 1 : 0;
+}
+
 // ── Сбор объявлений функций (fun / namespace::fun) ────────────────────────────
 
 void Interpreter::collect_functions(const Program& program) {
     for (const TopItem& item : program.items) {
-        if (item.kind == TopItem::Kind::Function) {
-            functions_[item.function.name] = &item.function;
-        } else if (item.kind == TopItem::Kind::Namespace) {
+        if (item.kind == TopItem::Kind::Function)
+            functions_[item.function.name].push_back(&item.function);
+        else if (item.kind == TopItem::Kind::Namespace)
             collect_namespace_functions(item.ns);
-        }
     }
 }
 
 void Interpreter::collect_namespace_functions(const NamespaceDecl& ns) {
-    for (const FunctionDecl& fn : ns.functions) {
-        functions_[ns.name + "::" + fn.name] = &fn;
-    }
+    for (const FunctionDecl& fn : ns.functions)
+        functions_[ns.name + "::" + fn.name].push_back(&fn);
 }
 
 // ── Выполнение top-level элементов ───────────────────────────────────────────
@@ -219,11 +244,17 @@ Interpreter::ExecResult Interpreter::exec_instr(const Instr& instr) {
         case InstrType::Let: {
             const auto& let_instr = static_cast<const LetInstr&>(instr);
             Value value = eval_expr(*let_instr.init);
-
-            if (had_runtime_error_) {
-                return {};
+            if (had_runtime_error_) return {};
+            // [Доп A.1.7] Неявное приведение при инициализации
+            if (let_instr.explicit_type == "float64") {
+                if (auto* i = std::get_if<std::int64_t>(&value.data))
+                    value = Value{static_cast<double>(*i)};
+                if (auto* b = std::get_if<bool>(&value.data))
+                    value = Value{static_cast<double>(*b ? 1.0 : 0.0)};
             }
-
+            if (let_instr.explicit_type == "int64" || let_instr.explicit_type == "uint64")
+                if (auto* b = std::get_if<bool>(&value.data))
+                    value = Value{static_cast<std::int64_t>(*b ? 1 : 0)};
             define_var(let_instr.name, std::move(value), false, let_instr.loc);
             return {};
         }
@@ -231,11 +262,17 @@ Interpreter::ExecResult Interpreter::exec_instr(const Instr& instr) {
         case InstrType::Var: {
             const auto& var_instr = static_cast<const VarInstr&>(instr);
             Value value = eval_expr(*var_instr.init);
-
-            if (had_runtime_error_) {
-                return {};
+            if (had_runtime_error_) return {};
+            // [Доп A.1.7] Неявное приведение при инициализации
+            if (var_instr.explicit_type == "float64") {
+                if (auto* i = std::get_if<std::int64_t>(&value.data))
+                    value = Value{static_cast<double>(*i)};
+                if (auto* b = std::get_if<bool>(&value.data))
+                    value = Value{static_cast<double>(*b ? 1.0 : 0.0)};
             }
-
+            if (var_instr.explicit_type == "int64" || var_instr.explicit_type == "uint64")
+                if (auto* b = std::get_if<bool>(&value.data))
+                    value = Value{static_cast<std::int64_t>(*b ? 1 : 0)};
             define_var(var_instr.name, std::move(value), true, var_instr.loc);
             return {};
         }
@@ -405,9 +442,45 @@ Interpreter::Value Interpreter::eval_expr(const Expr& expr) {
             return eval_index(static_cast<const IndexExpr&>(expr));
 
         case ExprType::NamespaceAccess:
-        case ExprType::Cast:
-            runtime_error(expr.loc, "this expression is not implemented in interpreter yet");
-            return {};
+
+        case ExprType::Sizeof: {
+            const auto& n = static_cast<const SizeofExpr&>(expr);
+            // Если операнд — идентификатор с именем типа, отдаём статический размер
+            if (n.operand->type == ExprType::Identif) {
+                const std::string& nm = static_cast<const IdentifExpr&>(*n.operand).name;
+                if (nm == "int64"   || nm == "uint64")  return Value{std::int64_t{8}};
+                if (nm == "float64")                    return Value{std::int64_t{8}};
+                if (nm == "string")                     return Value{std::int64_t{8}};
+                if (nm == "bool")                       return Value{std::int64_t{1}};
+                if (nm == "unit")                       return Value{std::int64_t{0}};
+            }
+            // Иначе вычисляем выражение и берём размер по runtime-типу
+            Value val = eval_expr(*n.operand);
+            if (had_runtime_error_) return {};
+            if (std::holds_alternative<std::int64_t>(val.data))                              return Value{std::int64_t{8}};
+            if (std::holds_alternative<double>(val.data))                                    return Value{std::int64_t{8}};
+            if (std::holds_alternative<std::string>(val.data))                               return Value{std::int64_t{8}};
+            if (std::holds_alternative<bool>(val.data))                                      return Value{std::int64_t{1}};
+            if (std::holds_alternative<UnitValue>(val.data))                                 return Value{std::int64_t{0}};
+            if (auto* arr = std::get_if<std::shared_ptr<ArrayValue>>(&val.data))             return Value{std::int64_t((*arr)->elements.size() * 8)};
+            if (auto* sv  = std::get_if<std::shared_ptr<StructValue>>(&val.data))            return Value{std::int64_t((*sv)->fields.size()    * 8)};
+            return Value{std::int64_t{8}};
+        }
+
+        case ExprType::Typeid:
+        case ExprType::Typeof: {
+            const auto& n = static_cast<const TypeidExpr&>(expr);
+            Value val = eval_expr(*n.operand);
+            if (had_runtime_error_) return {};
+            if (std::holds_alternative<std::int64_t>(val.data))                              return Value{std::string{"int64"}};
+            if (std::holds_alternative<double>(val.data))                                    return Value{std::string{"float64"}};
+            if (std::holds_alternative<bool>(val.data))                                      return Value{std::string{"bool"}};
+            if (std::holds_alternative<std::string>(val.data))                               return Value{std::string{"string"}};
+            if (std::holds_alternative<UnitValue>(val.data))                                 return Value{std::string{"unit"}};
+            if (std::holds_alternative<std::shared_ptr<ArrayValue>>(val.data))               return Value{std::string{"array"}};
+            if (auto* sv = std::get_if<std::shared_ptr<StructValue>>(&val.data))             return Value{(*sv)->type_name};
+            return Value{std::string{"unknown"}};
+        }
     }
 
     return {};
@@ -475,6 +548,15 @@ Interpreter::Value Interpreter::eval_unary(const UnaryExpr& expr) {
         return {};
     }
 
+    if (expr.op == TokenKind::Tilde) {
+        if (auto* value = std::get_if<std::int64_t>(&operand.data)) {
+            return Value{~(*value)};
+        }
+
+        runtime_error(expr.loc, "operator '~' requires integer operand");
+        return {};
+    }
+
     runtime_error(expr.loc, "unsupported unary operator");
     return {};
 }
@@ -517,6 +599,25 @@ Interpreter::Value Interpreter::eval_binary(const BinaryExpr& expr) {
 
     if (had_runtime_error_) {
         return {};
+    }
+
+    // [Доп A.1.7] Нормализуем bool → int64 для арифметических и сравнительных операций
+    {
+        bool promote = (expr.op == TokenKind::Plus  || expr.op == TokenKind::Minus
+            || expr.op == TokenKind::Star  || expr.op == TokenKind::Slash
+            || expr.op == TokenKind::Percent
+            || expr.op == TokenKind::Less  || expr.op == TokenKind::LessEqual
+            || expr.op == TokenKind::Greater || expr.op == TokenKind::GreaterEqual
+            || expr.op == TokenKind::EqualEqual  || expr.op == TokenKind::BangEqual
+            || expr.op == TokenKind::Ampersand   || expr.op == TokenKind::Pipe
+            || expr.op == TokenKind::Caret       || expr.op == TokenKind::LessLess
+            || expr.op == TokenKind::GreaterGreater);
+        if (promote) {
+            if (auto* b = std::get_if<bool>(&left.data))
+                left = Value{static_cast<std::int64_t>(*b ? 1 : 0)};
+            if (auto* b = std::get_if<bool>(&right.data))
+                right = Value{static_cast<std::int64_t>(*b ? 1 : 0)};
+        }
     }
 
     if (auto* l = std::get_if<std::int64_t>(&left.data)) {
@@ -563,8 +664,53 @@ Interpreter::Value Interpreter::eval_binary(const BinaryExpr& expr) {
                 case TokenKind::GreaterEqual:
                     return Value{*l >= *r};
 
+                case TokenKind::Ampersand:
+                    return Value{*l & *r};
+
+                case TokenKind::Pipe:
+                    return Value{*l | *r};
+
+                case TokenKind::Caret:
+                    return Value{*l ^ *r};
+
+                case TokenKind::LessLess:
+                    return Value{*l << *r};
+
+                case TokenKind::GreaterGreater:
+                    return Value{*l >> *r};
+
                 default:
                     break;
+            }
+        }
+    }
+
+    // [Доп A.1.7] Неявное приведение: int64 op float64 или float64 op int64 → float64
+    {
+        bool li = std::holds_alternative<std::int64_t>(left.data);
+        bool lf = std::holds_alternative<double>(left.data);
+        bool ri = std::holds_alternative<std::int64_t>(right.data);
+        bool rf = std::holds_alternative<double>(right.data);
+        if ((li || lf) && (ri || rf) && (lf || rf)) {
+            auto as_f = [](const Value& v) -> double {
+                if (auto* i = std::get_if<std::int64_t>(&v.data)) return static_cast<double>(*i);
+                return *std::get_if<double>(&v.data);
+            };
+            double lv = as_f(left), rv = as_f(right);
+            switch (expr.op) {
+                case TokenKind::Plus:         return Value{lv + rv};
+                case TokenKind::Minus:        return Value{lv - rv};
+                case TokenKind::Star:         return Value{lv * rv};
+                case TokenKind::Slash:
+                    if (rv == 0.0) { runtime_error(expr.loc, "division by zero"); return {}; }
+                    return Value{lv / rv};
+                case TokenKind::EqualEqual:   return Value{lv == rv};
+                case TokenKind::BangEqual:    return Value{lv != rv};
+                case TokenKind::Less:         return Value{lv <  rv};
+                case TokenKind::LessEqual:    return Value{lv <= rv};
+                case TokenKind::Greater:      return Value{lv >  rv};
+                case TokenKind::GreaterEqual: return Value{lv >= rv};
+                default: break;
             }
         }
     }
@@ -651,11 +797,68 @@ Interpreter::Value Interpreter::eval_binary(const BinaryExpr& expr) {
         if (expr.op == TokenKind::BangEqual)  return Value{false};
     }
 
+    // [Доп A.2.11] Пользовательский оператор для struct-типов
+    {
+        std::string op_sym = token_kind_to_op_string(expr.op);
+        if (!op_sym.empty()) {
+            auto it = functions_.find("operator" + op_sym);
+            if (it != functions_.end()) {
+                auto type_name = [](const Value& v) -> std::string {
+                    if (std::holds_alternative<std::int64_t>(v.data))                 return "int64";
+                    if (std::holds_alternative<double>(v.data))                        return "float64";
+                    if (std::holds_alternative<bool>(v.data))                          return "bool";
+                    if (std::holds_alternative<std::string>(v.data))                   return "string";
+                    if (std::holds_alternative<UnitValue>(v.data))                     return "unit";
+                    if (auto* sv = std::get_if<std::shared_ptr<StructValue>>(&v.data)) return (*sv)->type_name;
+                    return "array";
+                };
+                auto conv_rank = [](const std::string& from_t, const std::string& to_t) -> int {
+                    if (from_t == to_t) return 0;
+                    if ((from_t == "int64" || from_t == "uint64") &&
+                        (to_t   == "int64" || to_t   == "uint64")) return 0;
+                    if ((from_t == "int64" || from_t == "uint64") && to_t == "float64") return 1;
+                    if (from_t == "bool" && (to_t == "int64" || to_t == "uint64"))      return 2;
+                    return 10000;
+                };
+
+                std::vector<Value> op_args = { left, right };
+                auto total_rank = [&](const FunctionDecl* fn) -> int {
+                    if (fn->params.size() != 2) return 10001;
+                    int total = 0;
+                    for (std::size_t i = 0; i < 2; ++i) {
+                        int r = conv_rank(type_name(op_args[i]), fn->params[i].type_name);
+                        if (r >= 10000) return 10001;
+                        total += r;
+                    }
+                    return total;
+                };
+
+                int min_rank = 10001;
+                for (const FunctionDecl* fn : it->second) {
+                    int r = total_rank(fn);
+                    if (r < min_rank) min_rank = r;
+                }
+
+                if (min_rank < 10001) {
+                    const FunctionDecl* best = nullptr;
+                    int cnt = 0;
+                    for (const FunctionDecl* fn : it->second)
+                        if (total_rank(fn) == min_rank) { best = fn; ++cnt; }
+                    if (cnt > 1) {
+                        runtime_error(expr.loc, "ambiguous operator'" + op_sym + "'");
+                        return {};
+                    }
+                    return call_user_function(*best, op_args, expr.loc);
+                }
+            }
+        }
+    }
+
     runtime_error(expr.loc, "unsupported binary operation");
     return {};
 }
 
-// ── Вызов функции (builtin / пользовательская) ────────────────────────────────
+// ── [Доп A.2.9 + A.3.1] Вызов функции с разрешением перегрузок ───────────────
 
 Interpreter::Value Interpreter::eval_call(const CallExpr& expr) {
     if (
@@ -669,26 +872,80 @@ Interpreter::Value Interpreter::eval_call(const CallExpr& expr) {
     }
 
     auto it = functions_.find(expr.callee);
-
     if (it == functions_.end()) {
         runtime_error(expr.loc, "unknown function '" + expr.callee + "'");
         return {};
     }
 
     std::vector<Value> args;
-
     for (const auto& arg : expr.args) {
         args.push_back(eval_expr(*arg));
-
-        if (had_runtime_error_) {
-            return {};
-        }
+        if (had_runtime_error_) return {};
     }
 
-    return call_user_function(*it->second, args, expr.loc);
+    const auto& overloads = it->second;
+
+    // Тип значения в виде строки
+    auto type_name = [](const Value& v) -> std::string {
+        if (std::holds_alternative<std::int64_t>(v.data))                 return "int64";
+        if (std::holds_alternative<double>(v.data))                        return "float64";
+        if (std::holds_alternative<bool>(v.data))                          return "bool";
+        if (std::holds_alternative<std::string>(v.data))                   return "string";
+        if (std::holds_alternative<UnitValue>(v.data))                     return "unit";
+        if (auto* sv = std::get_if<std::shared_ptr<StructValue>>(&v.data)) return (*sv)->type_name;
+        return "array";
+    };
+
+    // Ранг конверсии одного аргумента:
+    //  0=exact/int64↔uint64, 1=widening int→float64, 2=promotion bool→int, 10000=несовместимо
+    auto conv_rank = [](const std::string& from_t, const std::string& to_t) -> int {
+        if (from_t == to_t) return 0;
+        if ((from_t == "int64" || from_t == "uint64") &&
+            (to_t   == "int64" || to_t   == "uint64")) return 0;
+        if ((from_t == "int64" || from_t == "uint64") && to_t == "float64") return 1;
+        if (from_t == "bool" && (to_t == "int64" || to_t == "uint64"))      return 2;
+        return 10000;
+    };
+
+    // Суммарный ранг для перегрузки (10001 = несовместима)
+    auto total_rank = [&](const FunctionDecl* fn) -> int {
+        if (fn->params.size() != args.size()) return 10001;
+        int total = 0;
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            int r = conv_rank(type_name(args[i]), fn->params[i].type_name);
+            if (r >= 10000) return 10001;
+            total += r;
+        }
+        return total;
+    };
+
+    // Минимальный ранг
+    int min_rank = 10001;
+    for (const FunctionDecl* fn : overloads) {
+        int r = total_rank(fn);
+        if (r < min_rank) min_rank = r;
+    }
+
+    if (min_rank >= 10001) {
+        runtime_error(expr.loc, "no matching overload of '" + expr.callee + "' for given arguments");
+        return {};
+    }
+
+    // Проверка на неоднозначность
+    const FunctionDecl* best = nullptr;
+    int best_count = 0;
+    for (const FunctionDecl* fn : overloads)
+        if (total_rank(fn) == min_rank) { best = fn; ++best_count; }
+
+    if (best_count > 1) {
+        runtime_error(expr.loc, "ambiguous call to overloaded function '" + expr.callee + "'");
+        return {};
+    }
+
+    return call_user_function(*best, args, expr.loc);
 }
 
-// ── Вызов пользовательской функции (fun) ─────────────────────────────────────
+// ── [Доп A.3.1] Вызов с неявными конверсиями аргументов и возврата ───────────
 
 Interpreter::Value Interpreter::call_user_function(
     const FunctionDecl& fn,
@@ -703,7 +960,17 @@ Interpreter::Value Interpreter::call_user_function(
     begin_scope();
 
     for (std::size_t i = 0; i < args.size(); ++i) {
-        define_var(fn.params[i].name, args[i], false, fn.loc);
+        Value arg = args[i];
+        const std::string& ptype = fn.params[i].type_name;
+        // int64/uint64 → float64
+        if (ptype == "float64")
+            if (auto* iv = std::get_if<std::int64_t>(&arg.data))
+                arg = Value{static_cast<double>(*iv)};
+        // bool → int64/uint64 (promotion)
+        if (ptype == "int64" || ptype == "uint64")
+            if (auto* bv = std::get_if<bool>(&arg.data))
+                arg = Value{static_cast<std::int64_t>(*bv ? 1 : 0)};
+        define_var(fn.params[i].name, std::move(arg), false, fn.loc);
     }
 
     ExecResult result = exec_block(fn.body);
@@ -711,7 +978,12 @@ Interpreter::Value Interpreter::call_user_function(
     end_scope();
 
     if (result.kind == FlowKind::Return) {
-        return result.value;
+        Value ret = result.value;
+        // Неявное приведение int64 → double если функция возвращает float64
+        if (!fn.return_type.empty() && fn.return_type == "float64")
+            if (auto* iv = std::get_if<std::int64_t>(&ret.data))
+                ret = Value{static_cast<double>(*iv)};
+        return ret;
     }
 
     return {};
@@ -886,6 +1158,16 @@ bool Interpreter::assign_to(const Expr& target, Value value) {
             return false;
         }
 
+        // [Доп A.1.7] Неявное приведение при присваивании: int→float64, bool→int64
+        if (std::holds_alternative<double>(var->value.data)) {
+            if (auto* i = std::get_if<std::int64_t>(&value.data))
+                value = Value{static_cast<double>(*i)};
+            if (auto* b = std::get_if<bool>(&value.data))
+                value = Value{static_cast<double>(*b ? 1.0 : 0.0)};
+        }
+        if (std::holds_alternative<std::int64_t>(var->value.data))
+            if (auto* b = std::get_if<bool>(&value.data))
+                value = Value{static_cast<std::int64_t>(*b ? 1 : 0)};
         var->value = deep_copy(value);
         return true;
     }
@@ -959,7 +1241,13 @@ std::string Interpreter::value_to_string(const Value& value) {
     if (auto* float_value = std::get_if<double>(&value.data)) {
         std::ostringstream out;
         out << *float_value;
-        return out.str();
+        std::string s = out.str();
+        // Гарантируем, что float всегда содержит десятичную точку
+        if (s.find('.') == std::string::npos &&
+            s.find('e') == std::string::npos &&
+            s.find('E') == std::string::npos)
+            s += ".0";
+        return s;
     }
 
     if (auto* bool_value = std::get_if<bool>(&value.data)) {

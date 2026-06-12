@@ -34,6 +34,9 @@ export enum class TokenKind {
     KwNamespace,
     KwAs,
     KwUnit,
+    KwSizeof,  // sizeof
+    KwTypeid,  // typeid
+    KwTypeof,  // typeof
 
     //символы
     LParen,      // (
@@ -63,7 +66,18 @@ export enum class TokenKind {
     GreaterEqual,// >=
 
     Arrow,       // ->
-    DoubleColon  // ::
+    DoubleColon, // ::
+
+    // битовые операции
+    Ampersand,      // &
+    Pipe,           // |
+    Caret,          // ^
+    Tilde,          // ~
+    LessLess,       // <<
+    GreaterGreater, // >>
+
+    // конвейер
+    PipeGreater     // |>
 };
 
 export struct Location {
@@ -76,6 +90,29 @@ export struct Token {
     Location  loca{};
     std::string lexeme;
 };
+
+// Возвращает символьное представление оператора ("+" , "==" и т.д.)
+// Пустая строка — не операторный токен.
+export inline std::string token_kind_to_op_string(TokenKind kind) {
+    switch (kind) {
+        case TokenKind::Plus:         return "+";
+        case TokenKind::Minus:        return "-";
+        case TokenKind::Star:         return "*";
+        case TokenKind::Slash:        return "/";
+        case TokenKind::Percent:      return "%";
+        case TokenKind::EqualEqual:   return "==";
+        case TokenKind::BangEqual:    return "!=";
+        case TokenKind::Less:         return "<";
+        case TokenKind::LessEqual:    return "<=";
+        case TokenKind::Greater:      return ">";
+        case TokenKind::GreaterEqual: return ">=";
+        case TokenKind::Tilde:        return "~";
+        case TokenKind::Ampersand:    return "&";
+        case TokenKind::Pipe:         return "|";
+        case TokenKind::Caret:        return "^";
+        default:                      return "";
+    }
+}
 
 export inline std::string_view token_kind_to_string(TokenKind kind) {
     switch (kind) {
@@ -107,6 +144,9 @@ export inline std::string_view token_kind_to_string(TokenKind kind) {
         case TokenKind::KwNamespace:  return "KwNamespace";
         case TokenKind::KwAs:         return "KwAs";
         case TokenKind::KwUnit:       return "KwUnit";
+        case TokenKind::KwSizeof:     return "KwSizeof";
+        case TokenKind::KwTypeid:     return "KwTypeid";
+        case TokenKind::KwTypeof:     return "KwTypeof";
 
         case TokenKind::LParen:       return "LParen";
         case TokenKind::RParen:       return "RParen";
@@ -134,8 +174,16 @@ export inline std::string_view token_kind_to_string(TokenKind kind) {
         case TokenKind::Greater:      return "Greater";
         case TokenKind::GreaterEqual: return "GreaterEqual";
 
-        case TokenKind::Arrow:        return "Arrow";
-        case TokenKind::DoubleColon:  return "DoubleColon";
+        case TokenKind::Arrow:          return "Arrow";
+        case TokenKind::DoubleColon:    return "DoubleColon";
+
+        case TokenKind::Ampersand:      return "Ampersand";
+        case TokenKind::Pipe:           return "Pipe";
+        case TokenKind::Caret:          return "Caret";
+        case TokenKind::Tilde:          return "Tilde";
+        case TokenKind::LessLess:       return "LessLess";
+        case TokenKind::GreaterGreater: return "GreaterGreater";
+        case TokenKind::PipeGreater:    return "PipeGreater";
     }
     return "Unknown";
 }

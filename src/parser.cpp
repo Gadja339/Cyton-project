@@ -95,8 +95,23 @@ TopItem Parser::parse_top_item() {
 FunctionDecl Parser::parse_function_decl() {
     consume(TokenKind::KwFun, "Ожидается 'fun'");
     FunctionDecl decl;
-    decl.loc  = peek().loca;
-    decl.name = consume(TokenKind::Identifier, "Ожидается имя функции").lexeme;
+    decl.loc = peek().loca;
+
+    // [Доп A.2.11] Перегрузка операторов: fun operator+(...)
+    if (check(TokenKind::Identifier) && peek().lexeme == "operator") {
+        ++pos_;  // consume "operator"
+        std::string op = token_kind_to_op_string(peek().kind);
+        if (op.empty()) {
+            const Token& t = peek();
+            std::cerr << t.loca.line << ":" << t.loca.col
+                      << ": error: ожидается символ оператора после 'operator'\n";
+            throw std::runtime_error("parse error");
+        }
+        ++pos_;  // consume operator symbol
+        decl.name = "operator" + op;
+    } else {
+        decl.name = consume(TokenKind::Identifier, "Ожидается имя функции").lexeme;
+    }
 
     consume(TokenKind::LParen, "Ожидается '(' после имени функции");
     if (!check(TokenKind::RParen)) {
@@ -188,7 +203,7 @@ std::vector<std::unique_ptr<Instr>> Parser::parse_block() {
         body.push_back(parse_instr());
         skip_newlines();
     }
-    consume(TokenKind::Semicolon, "expected ';' to close block");
+    consume(TokenKind::Semicolon, "Ожидается ';'");
     return body;
 }
 
@@ -203,12 +218,12 @@ std::unique_ptr<Instr> Parser::parse_instr() {
 
     if (match(TokenKind::KwBreak)) {
         Location loc = previous().loca;
-        consume_newline("expected newline after 'break'");
+        consume_newline("Ожидается переход после 'break'");
         return std::make_unique<BreakInstr>(loc);
     }
     if (match(TokenKind::KwContinue)) {
         Location loc = previous().loca;
-        consume_newline("expected newline after 'continue'");
+        consume_newline("Ожидается переход после 'continue'");
         return std::make_unique<ContinueInstr>(loc);
     }
 
@@ -217,11 +232,11 @@ std::unique_ptr<Instr> Parser::parse_instr() {
 
     if (match(TokenKind::Assign)) {
         auto value = parse_expr();
-        consume_newline("expected newline after assignment");
+        consume_newline("Ожидается переход после assignment");
         return std::make_unique<AssignInstr>(std::move(expr), std::move(value), loc);
     }
 
-    consume_newline("expected newline after expression");
+    consume_newline("Ожидается переход после expression");
     return std::make_unique<ExprInstr>(std::move(expr), loc);
 }
 
@@ -230,7 +245,7 @@ std::unique_ptr<Instr> Parser::parse_var_decl(bool is_var) {
     Location loc = previous().loca;
 
     std::string explicit_type;
-    if (check(TokenKind::Identifier)) {
+    if (check(TokenKind::Identifier) || check(TokenKind::KwUnit)) {
         std::size_t saved      = pos_;
         std::string maybe_type = parse_type_name();
         if (check(TokenKind::Identifier))
@@ -239,10 +254,10 @@ std::unique_ptr<Instr> Parser::parse_var_decl(bool is_var) {
             pos_ = saved;
     }
 
-    std::string name = consume(TokenKind::Identifier, "expected variable name").lexeme;
-    consume(TokenKind::Assign, "expected '=' after variable name");
+    std::string name = consume(TokenKind::Identifier, "ожидает variable name").lexeme;
+    consume(TokenKind::Assign, "ожидает '=' после variable name");
     auto init = parse_expr();
-    consume_newline("expected newline after variable declaration");
+    consume_newline("ожидает переход после variable declaration");
 
     if (is_var) return std::make_unique<VarInstr>(name, explicit_type, std::move(init), loc);
     return std::make_unique<LetInstr>(name, explicit_type, std::move(init), loc);
@@ -250,12 +265,12 @@ std::unique_ptr<Instr> Parser::parse_var_decl(bool is_var) {
 
 // if / else
 std::unique_ptr<Instr> Parser::parse_if() {
-    consume(TokenKind::KwIf, "expected 'if'");
+    consume(TokenKind::KwIf, "ожидает 'if'");
     Location loc = previous().loca;
     auto condition = parse_expr();
 
-    consume(TokenKind::Colon, "expected ':' after if condition");
-    consume(TokenKind::Newline, "expected newline after ':'");
+    consume(TokenKind::Colon, "ожидает ':' после if condition");
+    consume(TokenKind::Newline, "ожидает переход after ':'");
 
     // then-ветка заканчивается на ';' или 'else'
     std::vector<std::unique_ptr<Instr>> then_branch;
@@ -267,8 +282,8 @@ std::unique_ptr<Instr> Parser::parse_if() {
 
     std::vector<std::unique_ptr<Instr>> else_branch;
     if (match(TokenKind::KwElse)) {
-        consume(TokenKind::Colon, "expected ':' after 'else'");
-        consume(TokenKind::Newline, "expected newline after ':'");
+        consume(TokenKind::Colon, "ожидает ':' после 'else'");
+        consume(TokenKind::Newline, "ожидает переход after ':'");
         skip_newlines();
         while (!check(TokenKind::Semicolon) && !is_at_end()) {
             else_branch.push_back(parse_instr());
@@ -276,14 +291,14 @@ std::unique_ptr<Instr> Parser::parse_if() {
         }
     }
 
-    consume(TokenKind::Semicolon, "expected ';' to close if");
+    consume(TokenKind::Semicolon, "ожидает ';' to close if");
     return std::make_unique<IfInstr>(
         std::move(condition), std::move(then_branch), std::move(else_branch), loc);
 }
 
 // while
 std::unique_ptr<Instr> Parser::parse_while() {
-    consume(TokenKind::KwWhile, "expected 'while'");
+    consume(TokenKind::KwWhile, "ожидает 'while'");
     Location loc   = previous().loca;
     auto condition = parse_expr();
     auto body      = parse_block();
@@ -292,18 +307,38 @@ std::unique_ptr<Instr> Parser::parse_while() {
 
 // return
 std::unique_ptr<Instr> Parser::parse_return() {
-    consume(TokenKind::KwReturn, "expected 'return'");
+    consume(TokenKind::KwReturn, "ожидает 'return'");
     Location loc = previous().loca;
     std::unique_ptr<Expr> value;
     if (!check(TokenKind::Newline) && !is_at_end())
         value = parse_expr();
-    consume_newline("expected newline after 'return'");
+    consume_newline("ожидает перезод после 'return'");
     return std::make_unique<ReturnInstr>(std::move(value), loc);
 }
 
 // ── Выражения ────────────────────────────────────────────────────────────────
 
-std::unique_ptr<Expr> Parser::parse_expr()        { return parse_cast(); }
+std::unique_ptr<Expr> Parser::parse_expr() { return parse_pipeline(); }
+
+// [Доп A.1.9] Конвейерный оператор: x |> f  →  f(x),  x |> f(y)  →  f(x, y)
+std::unique_ptr<Expr> Parser::parse_pipeline() {
+    auto expr = parse_cast();
+    while (match(TokenKind::PipeGreater)) {
+        Location    loc  = previous().loca;
+        std::string name = consume(TokenKind::Identifier,
+                                   "ожидается имя функции после '|>'").lexeme;
+        std::vector<std::unique_ptr<Expr>> args;
+        args.push_back(std::move(expr));
+        if (match(TokenKind::LParen)) {
+            if (!check(TokenKind::RParen)) {
+                do { args.push_back(parse_expr()); } while (match(TokenKind::Comma));
+            }
+            consume(TokenKind::RParen, "ожидается ')' после аргументов");
+        }
+        expr = std::make_unique<CallExpr>(std::move(name), std::move(args), loc);
+    }
+    return expr;
+}
 
 // as (приведение типа)
 std::unique_ptr<Expr> Parser::parse_cast() {
@@ -328,8 +363,39 @@ std::unique_ptr<Expr> Parser::parse_logical_or() {
 }
 
 std::unique_ptr<Expr> Parser::parse_logical_and() {
-    auto expr = parse_equality();
+    auto expr = parse_bitwise_or();
     while (match(TokenKind::KwAnd)) {
+        Token op    = previous();
+        auto  right = parse_bitwise_or();
+        expr = std::make_unique<BinaryExpr>(std::move(expr), op.kind, std::move(right), op.loca);
+    }
+    return expr;
+}
+
+// [Доп A.1.8] Битовые операции: | ^ & << >> ~
+std::unique_ptr<Expr> Parser::parse_bitwise_or() {
+    auto expr = parse_bitwise_xor();
+    while (match(TokenKind::Pipe)) {
+        Token op    = previous();
+        auto  right = parse_bitwise_xor();
+        expr = std::make_unique<BinaryExpr>(std::move(expr), op.kind, std::move(right), op.loca);
+    }
+    return expr;
+}
+
+std::unique_ptr<Expr> Parser::parse_bitwise_xor() {
+    auto expr = parse_bitwise_and();
+    while (match(TokenKind::Caret)) {
+        Token op    = previous();
+        auto  right = parse_bitwise_and();
+        expr = std::make_unique<BinaryExpr>(std::move(expr), op.kind, std::move(right), op.loca);
+    }
+    return expr;
+}
+
+std::unique_ptr<Expr> Parser::parse_bitwise_and() {
+    auto expr = parse_equality();
+    while (match(TokenKind::Ampersand)) {
         Token op    = previous();
         auto  right = parse_equality();
         expr = std::make_unique<BinaryExpr>(std::move(expr), op.kind, std::move(right), op.loca);
@@ -350,9 +416,20 @@ std::unique_ptr<Expr> Parser::parse_equality() {
 
 // < / <= / > / >=
 std::unique_ptr<Expr> Parser::parse_comparison() {
-    auto expr = parse_term();
+    auto expr = parse_shift();
     while (match(TokenKind::Less)    || match(TokenKind::LessEqual) ||
            match(TokenKind::Greater) || match(TokenKind::GreaterEqual)) {
+        Token op    = previous();
+        auto  right = parse_shift();
+        expr = std::make_unique<BinaryExpr>(std::move(expr), op.kind, std::move(right), op.loca);
+    }
+    return expr;
+}
+
+// << / >> (битовые сдвиги)
+std::unique_ptr<Expr> Parser::parse_shift() {
+    auto expr = parse_term();
+    while (match(TokenKind::LessLess) || match(TokenKind::GreaterGreater)) {
         Token op    = previous();
         auto  right = parse_term();
         expr = std::make_unique<BinaryExpr>(std::move(expr), op.kind, std::move(right), op.loca);
@@ -382,9 +459,9 @@ std::unique_ptr<Expr> Parser::parse_factor() {
     return expr;
 }
 
-// унарный - / not
+// унарный - / not / ~ (битовое NOT)
 std::unique_ptr<Expr> Parser::parse_unary() {
-    if (match(TokenKind::Minus) || match(TokenKind::KwNot)) {
+    if (match(TokenKind::Minus) || match(TokenKind::KwNot) || match(TokenKind::Tilde)) {
         Token op    = previous();
         auto  right = parse_unary();
         return std::make_unique<UnaryExpr>(op.kind, std::move(right), op.loca);
@@ -400,21 +477,21 @@ std::unique_ptr<Expr> Parser::parse_postfix() {
         if (match(TokenKind::LParen)) {
             Location loc = previous().loca;
             auto     args = parse_arg_list();
-            consume(TokenKind::RParen, "expected ')' after arguments");
+            consume(TokenKind::RParen, "ожидает ')' после arguments");
             expr = std::make_unique<CallExpr>(flatten_callee(expr.get()),
                                                std::move(args), loc);
         } else if (match(TokenKind::LBracket)) {
             Location loc   = previous().loca;
             auto     index = parse_expr();
-            consume(TokenKind::RBracket, "expected ']' after index");
+            consume(TokenKind::RBracket, "ожидает ']' после index");
             expr = std::make_unique<IndexExpr>(std::move(expr), std::move(index), loc);
         } else if (match(TokenKind::Dot)) {
             Location    loc   = previous().loca;
-            std::string field = consume(TokenKind::Identifier, "expected field name").lexeme;
+            std::string field = consume(TokenKind::Identifier, "ожидает field name").lexeme;
             expr = std::make_unique<FieldExpr>(std::move(expr), std::move(field), loc);
         } else if (match(TokenKind::DoubleColon)) {
             Location    loc    = previous().loca;
-            std::string member = consume(TokenKind::Identifier, "expected member name after '::'").lexeme;
+            std::string member = consume(TokenKind::Identifier, "ожидает member name after '::'").lexeme;
             expr = std::make_unique<NamespaceAccessExpr>(std::move(expr), std::move(member), loc);
         } else {
             break;
@@ -462,28 +539,42 @@ std::unique_ptr<Expr> Parser::parse_primary() {
                 do {
                     skip_newlines();
                     StructFieldInit fi;
-                    fi.name  = consume(TokenKind::Identifier, "expected field name").lexeme;
-                    consume(TokenKind::Colon, "expected ':' after field name");
+                    fi.name  = consume(TokenKind::Identifier, "ожидает field name").lexeme;
+                    consume(TokenKind::Colon, "ожидает ':' после field name");
                     fi.value = parse_expr();
                     fields.push_back(std::move(fi));
                 } while (match(TokenKind::Comma));
             }
             skip_newlines();
-            consume(TokenKind::RBrace, "expected '}' after struct literal");
+            consume(TokenKind::RBrace, "ожидает '}' после struct literal");
             return std::make_unique<StructLitExpr>(name.lexeme, std::move(fields), name.loca);
         }
         return std::make_unique<IdentifExpr>(name.lexeme, name.loca);
     }
 
+    // [Доп A.1.11] Мета-функции: sizeof(…), typeid(…), typeof(…)
+    if (match(TokenKind::KwSizeof) || match(TokenKind::KwTypeid) || match(TokenKind::KwTypeof)) {
+        Token kw  = previous();
+        Location loc = kw.loca;
+        consume(TokenKind::LParen, "ожидает '(' после '" + kw.lexeme + "'");
+        auto operand = parse_expr();
+        consume(TokenKind::RParen, "ожидает ')' после argument");
+        if (kw.kind == TokenKind::KwSizeof)
+            return std::make_unique<SizeofExpr>(std::move(operand), loc);
+        if (kw.kind == TokenKind::KwTypeid)
+            return std::make_unique<TypeidExpr>(std::move(operand), loc);
+        return std::make_unique<TypeofExpr>(std::move(operand), loc);
+    }
+
     if (match(TokenKind::LParen)) {
         auto expr = parse_expr();
-        consume(TokenKind::RParen, "expected ')' after expression");
+        consume(TokenKind::RParen, "ожидает ')' после expression");
         return expr;
     }
 
     const Token& t = peek();
-    std::cerr << t.loca.line << ":" << t.loca.col << ": error: expected expression\n";
-    throw std::runtime_error("parse error");
+    std::cerr << t.loca.line << ":" << t.loca.col << ": error: ожидает expression\n";
+    throw std::runtime_error("ошибка парсера");
 }
 
 std::vector<std::unique_ptr<Expr>> Parser::parse_arg_list() {

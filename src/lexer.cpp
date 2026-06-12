@@ -55,6 +55,22 @@ void Lexer::skip_comment() {
     while (!is_at_end() && peek() != '\n') advance();
 }
 
+// ── [Доп A.1.12] Блочные комментарии /* … */ с поддержкой вложенности ────────
+void Lexer::skip_block_comment() {
+    int depth = 1;
+    while (!is_at_end() && depth > 0) {
+        if (peek() == '/' && peek_next() == '*') {
+            advance(); advance();
+            ++depth;
+        } else if (peek() == '*' && peek_next() == '/') {
+            advance(); advance();
+            --depth;
+        } else {
+            advance();
+        }
+    }
+}
+
 // ── Конструирование токенов ───────────────────────────────────────────────────
 
 Token Lexer::make_token(TokenKind kind, std::size_t start_pos,
@@ -118,6 +134,9 @@ TokenKind Lexer::keyword_kind(std::string_view text) {
     if (text == "namespace") return TokenKind::KwNamespace;
     if (text == "as")        return TokenKind::KwAs;
     if (text == "unit")      return TokenKind::KwUnit;
+    if (text == "sizeof")    return TokenKind::KwSizeof;  // A.1.11
+    if (text == "typeid")    return TokenKind::KwTypeid;  // A.1.11
+    if (text == "typeof")    return TokenKind::KwTypeof;  // A.1.11
     return TokenKind::Identifier;
 }
 
@@ -238,7 +257,9 @@ Token Lexer::next_token() {
 
             case '+': return make_simple_token(TokenKind::Plus,    '+', start_line, start_column);
             case '*': return make_simple_token(TokenKind::Star,    '*', start_line, start_column);
-            case '/': return make_simple_token(TokenKind::Slash,   '/', start_line, start_column);
+            case '/':
+                if (match('*')) { skip_block_comment(); continue; } // A.1.12
+                return make_simple_token(TokenKind::Slash, '/', start_line, start_column);
             case '%': return make_simple_token(TokenKind::Percent, '%', start_line, start_column);
 
             case '-':
@@ -254,12 +275,22 @@ Token Lexer::next_token() {
                 return make_invalid_token("unexpected character '!'", start_line, start_column);
 
             case '<':
-                if (match('=')) return make_token(TokenKind::LessEqual, start_pos, start_line, start_column);
+                if (match('<')) return make_token(TokenKind::LessLess,    start_pos, start_line, start_column); // A.1.8 сдвиг влево
+                if (match('=')) return make_token(TokenKind::LessEqual,    start_pos, start_line, start_column);
                 return make_simple_token(TokenKind::Less, '<', start_line, start_column);
 
             case '>':
-                if (match('=')) return make_token(TokenKind::GreaterEqual, start_pos, start_line, start_column);
+                if (match('>')) return make_token(TokenKind::GreaterGreater, start_pos, start_line, start_column); // A.1.8 сдвиг вправо
+                if (match('=')) return make_token(TokenKind::GreaterEqual,   start_pos, start_line, start_column);
                 return make_simple_token(TokenKind::Greater, '>', start_line, start_column);
+
+            // A.1.8 Битовые операции: & | ^ ~
+            case '&': return make_simple_token(TokenKind::Ampersand, '&', start_line, start_column);
+            case '|':
+                if (match('>')) return make_token(TokenKind::PipeGreater, start_pos, start_line, start_column); // A.1.9 конвейер |>
+                return make_simple_token(TokenKind::Pipe, '|', start_line, start_column);
+            case '^': return make_simple_token(TokenKind::Caret,     '^', start_line, start_column);
+            case '~': return make_simple_token(TokenKind::Tilde,     '~', start_line, start_column);
 
             case ':':
                 if (match(':')) return make_token(TokenKind::DoubleColon, start_pos, start_line, start_column);

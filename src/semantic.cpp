@@ -11,6 +11,30 @@ static bool is_integer(ValueType v) {
     return v == ValueType::Int64 || v == ValueType::Uint64;
 }
 
+// [Доп A.1.7] Неявное расширение типов: int→float64, bool→int, bool→float64
+static bool can_widen(const TypeInfo& from, const TypeInfo& to) {
+    if (is_integer(from.base) && to.base == ValueType::Float64)       return true;
+    if (from.base == ValueType::Bool && is_integer(to.base))           return true;
+    if (from.base == ValueType::Bool && to.base == ValueType::Float64) return true;
+    return false;
+}
+
+// [Доп A.3.1] Ранг конверсии для разрешения перегрузок с неявными приведениями:
+//   0     — точное совпадение / unknown-wildcard / int64↔uint64
+//   1     — widening: int64/uint64 → float64
+//   2     — promotion: bool → int64/uint64
+//   10000 — несовместимые типы
+static int conversion_rank(const TypeInfo& from, const TypeInfo& to) {
+    if (from.is_unknown() || to.is_unknown())          return 0;
+    if (is_integer(from.base) && is_integer(to.base))  return 0;  // int64↔uint64
+    if (from.base == to.base) {
+        if (from.base != ValueType::Struct || from.name == to.name) return 0;
+    }
+    if (is_integer(from.base) && to.base == ValueType::Float64) return 1;
+    if (from.base == ValueType::Bool && is_integer(to.base))    return 2;
+    return 10000;
+}
+
 // ── Конструктор ───────────────────────────────────────────────────────────────
 
 SemanticAnalyzer::SemanticAnalyzer(std::string filename)
@@ -21,6 +45,7 @@ SemanticAnalyzer::SemanticAnalyzer(std::string filename)
 bool SemanticAnalyzer::analyze(const Program& program) {
     // Сброс состояния
     had_error_            = false;
+    repl_mode_            = false;
     scopes_.clear();
     functions_.clear();
     structs_.clear();
@@ -32,13 +57,12 @@ bool SemanticAnalyzer::analyze(const Program& program) {
 
     begin_scope();
 
-    // Встроенные функции
-    // print принимает аргумент любого типа (Unknown = wildcard)
-    functions_["print"]  = FunctionSymbol{{TypeInfo::unknown()},              TypeInfo::unit()};
-    functions_["input"]  = FunctionSymbol{{},                                 TypeInfo::of(ValueType::String)};
-    functions_["exit"]   = FunctionSymbol{{TypeInfo::of(ValueType::Int64)},  TypeInfo::unit()};
-    functions_["panic"]  = FunctionSymbol{{TypeInfo::of(ValueType::String)}, TypeInfo::unit()};
-    functions_["assert"] = FunctionSymbol{{TypeInfo::of(ValueType::Bool)},   TypeInfo::unit()};
+    // Встроенные функции (Unknown = wildcard для print)
+    functions_["print"] .push_back(FunctionSymbol{{TypeInfo::unknown()},              TypeInfo::unit()});
+    functions_["input"] .push_back(FunctionSymbol{{},                                 TypeInfo::of(ValueType::String)});
+    functions_["exit"]  .push_back(FunctionSymbol{{TypeInfo::of(ValueType::Int64)},  TypeInfo::unit()});
+    functions_["panic"] .push_back(FunctionSymbol{{TypeInfo::of(ValueType::String)}, TypeInfo::unit()});
+    functions_["assert"].push_back(FunctionSymbol{{TypeInfo::of(ValueType::Bool)},   TypeInfo::unit()});
 
     // Проход 1: type aliases — должны быть известны до struct fields
     for (const auto& item : program.items)
@@ -75,6 +99,63 @@ bool SemanticAnalyzer::analyze(const Program& program) {
     return !had_error_;
 }
 
+// ── REPL: инициализация и пошаговый анализ ────────────────────────────────────
+
+void SemanticAnalyzer::init_repl() {
+    had_error_ = false;
+    repl_mode_ = true;
+    scopes_.clear();
+    functions_.clear();
+    structs_.clear();
+    type_aliases_.clear();
+    namespace_stack_.clear();
+    loop_depth_          = 0;
+    inside_function_     = false;
+    current_return_type_ = TypeInfo::unit();
+
+    begin_scope();  // глобальный скоуп остаётся открытым на всё время сессии
+
+    functions_["print"] .push_back(FunctionSymbol{{TypeInfo::unknown()},              TypeInfo::unit()});
+    functions_["input"] .push_back(FunctionSymbol{{},                                 TypeInfo::of(ValueType::String)});
+    functions_["exit"]  .push_back(FunctionSymbol{{TypeInfo::of(ValueType::Int64)},  TypeInfo::unit()});
+    functions_["panic"] .push_back(FunctionSymbol{{TypeInfo::of(ValueType::String)}, TypeInfo::unit()});
+    functions_["assert"].push_back(FunctionSymbol{{TypeInfo::of(ValueType::Bool)},   TypeInfo::unit()});
+}
+
+bool SemanticAnalyzer::analyze_chunk(const Program& program) {
+    had_error_ = false;
+
+    // Проход 1: type aliases
+    for (const auto& item : program.items)
+        if (item.kind == TopItem::Kind::TypeAlias)
+            collect_type_alias(item.type_alias);
+
+    // Проход 2а: имена структур
+    for (const auto& item : program.items)
+        if (item.kind == TopItem::Kind::Struct) {
+            const auto& decl = item.structure;
+            if (!structs_.count(decl.name))
+                structs_[decl.name] = StructSymbol{};
+        }
+
+    // Проход 2б: поля структур
+    for (const auto& item : program.items)
+        if (item.kind == TopItem::Kind::Struct)
+            collect_struct(item.structure);
+
+    // Проход 3: сигнатуры функций
+    for (const auto& item : program.items) {
+        if      (item.kind == TopItem::Kind::Function)  collect_function(item.function);
+        else if (item.kind == TopItem::Kind::Namespace) collect_namespace(item.ns);
+    }
+
+    // Проход 4: тела
+    for (const auto& item : program.items)
+        analyze_top_item(item);
+
+    return !had_error_;
+}
+
 // ── Диагностика ───────────────────────────────────────────────────────────────
 
 void SemanticAnalyzer::error(Location loc, const std::string& message) {
@@ -93,7 +174,12 @@ bool SemanticAnalyzer::declare_symbol(const std::string& name, Symbol symbol,
                                        Location loc) {
     auto& cur = scopes_.back();
     if (cur.count(name)) {
-        error(loc, "name '" + name + "' is already declared in this scope");
+        // В REPL-режиме разрешаем переопределение переменных в глобальном скоупе
+        if (repl_mode_ && scopes_.size() == 1) {
+            cur[name] = std::move(symbol);
+            return true;
+        }
+        error(loc, "name '" + name + "' уже объявлено в этой области видимости");
         return false;
     }
     cur[name] = std::move(symbol);
@@ -151,7 +237,7 @@ bool SemanticAnalyzer::returns_on_all_paths(
 
 void SemanticAnalyzer::collect_type_alias(const TypeAliasDecl& decl) {
     if (type_aliases_.count(decl.name)) {
-        error(decl.loc, "type alias '" + decl.name + "' is already declared");
+        error(decl.loc, "type alias '" + decl.name + "' уже объявлено");
         return;
     }
     type_aliases_[decl.name] = decl.target;
@@ -175,16 +261,25 @@ void SemanticAnalyzer::collect_struct(const StructDecl& decl) {
 
 void SemanticAnalyzer::collect_function(const FunctionDecl& decl) {
     std::string qname = qualified_name(decl.name);
-    if (functions_.count(qname)) {
-        error(decl.loc, "function '" + qname + "' is already declared");
-        return;
-    }
     std::vector<TypeInfo> param_types;
     for (const auto& p : decl.params)
         param_types.push_back(type_from_string(p.type_name));
     TypeInfo ret = decl.return_type.empty() ? TypeInfo::unit()
                                             : type_from_string(decl.return_type);
-    functions_[qname] = FunctionSymbol{std::move(param_types), ret};
+
+    // Проверка: нельзя объявить две функции с полностью одинаковой сигнатурой
+    for (const auto& existing : functions_[qname]) {
+        if (existing.param_types.size() == param_types.size()) {
+            bool identical = true;
+            for (std::size_t i = 0; i < param_types.size(); ++i)
+                if (existing.param_types[i] != param_types[i]) { identical = false; break; }
+            if (identical) {
+                error(decl.loc, "function '" + qname + "' с уже заявленной идентичной подписью");
+                return;
+            }
+        }
+    }
+    functions_[qname].push_back(FunctionSymbol{std::move(param_types), ret});
 }
 
 void SemanticAnalyzer::collect_namespace(const NamespaceDecl& decl) {
@@ -226,7 +321,7 @@ void SemanticAnalyzer::analyze_function(const FunctionDecl& decl) {
     if (current_return_type_.base != ValueType::Unit &&
         !returns_on_all_paths(decl.body)) {
         error(decl.loc, "function '" + decl.name
-              + "' does not return a value on all execution paths");
+              + "' не возвращает значение");
     }
 
     inside_function_     = prev_inside;
@@ -253,8 +348,9 @@ void SemanticAnalyzer::analyze_instr(const Instr& instr) {
                 TypeInfo declared = type_from_string(n.explicit_type);
                 if (declared.is_unknown())
                     error(n.loc, "unknown type '" + n.explicit_type + "'");
-                else if (!init_type.is_unknown() && !same_type(declared, init_type))
-                    error(n.loc, "cannot initialize '" + n.name + "': expected "
+                else if (!init_type.is_unknown() && !same_type(declared, init_type)
+                         && !can_widen(init_type, declared))
+                    error(n.loc, "не может иницыализировать '" + n.name + "': ожидает "
                                  + type_to_string(declared)
                                  + ", got " + type_to_string(init_type));
                 final_type = declared;
@@ -270,9 +366,10 @@ void SemanticAnalyzer::analyze_instr(const Instr& instr) {
             if (!n.explicit_type.empty()) {
                 TypeInfo declared = type_from_string(n.explicit_type);
                 if (declared.is_unknown())
-                    error(n.loc, "unknown type '" + n.explicit_type + "'");
-                else if (!init_type.is_unknown() && !same_type(declared, init_type))
-                    error(n.loc, "cannot initialize '" + n.name + "': expected "
+                    error(n.loc, "Не известный тип '" + n.explicit_type + "'");
+                else if (!init_type.is_unknown() && !same_type(declared, init_type)
+                         && !can_widen(init_type, declared))
+                    error(n.loc, "Не может иницыализировать '" + n.name + "': ожидает "
                                  + type_to_string(declared)
                                  + ", got " + type_to_string(init_type));
                 final_type = declared;
@@ -290,8 +387,9 @@ void SemanticAnalyzer::analyze_instr(const Instr& instr) {
             TypeInfo tgt    = resolve_lvalue_type(*n.target);
             TypeInfo val    = analyze_expr(*n.value);
             check_lvalue_mutable(*n.target);          // сообщает об ошибке внутри
-            if (!tgt.is_unknown() && !val.is_unknown() && !same_type(tgt, val))
-                error(n.loc, "assignment type mismatch: expected "
+            if (!tgt.is_unknown() && !val.is_unknown() &&
+                !same_type(tgt, val) && !can_widen(val, tgt))
+                error(n.loc, "несоответствие типо: ожидается "
                              + type_to_string(tgt)
                              + ", got " + type_to_string(val));
             break;
@@ -302,7 +400,7 @@ void SemanticAnalyzer::analyze_instr(const Instr& instr) {
             TypeInfo cond = analyze_expr(*n.condition);
             if (!cond.is_unknown() && cond.base != ValueType::Bool)
                 error(n.condition->loc,
-                      "if condition must be bool, got " + type_to_string(cond));
+                      "if условие должно быть bool, got " + type_to_string(cond));
             begin_scope();
             for (const auto& i : n.then_branch) analyze_instr(*i);
             end_scope();
@@ -317,7 +415,7 @@ void SemanticAnalyzer::analyze_instr(const Instr& instr) {
             TypeInfo cond = analyze_expr(*n.condition);
             if (!cond.is_unknown() && cond.base != ValueType::Bool)
                 error(n.condition->loc,
-                      "while condition must be bool, got " + type_to_string(cond));
+                      "while условие должно быть bool, got " + type_to_string(cond));
             ++loop_depth_;
             begin_scope();
             for (const auto& i : n.body) analyze_instr(*i);
@@ -329,12 +427,13 @@ void SemanticAnalyzer::analyze_instr(const Instr& instr) {
         case InstrType::Return: {
             const auto& n = static_cast<const ReturnInstr&>(instr);
             if (!inside_function_) {
-                error(n.loc, "return is not allowed outside a function");
+                error(n.loc, "return нельзя за пределами функции");
                 break;
             }
             TypeInfo ret = n.value ? analyze_expr(*n.value) : TypeInfo::unit();
-            if (!ret.is_unknown() && !same_type(current_return_type_, ret))
-                error(n.loc, "return type mismatch: expected "
+            if (!ret.is_unknown() && !same_type(current_return_type_, ret)
+                && !can_widen(ret, current_return_type_))
+                error(n.loc, "return тип мимо: ожидается "
                              + type_to_string(current_return_type_)
                              + ", got " + type_to_string(ret));
             break;
@@ -342,12 +441,12 @@ void SemanticAnalyzer::analyze_instr(const Instr& instr) {
 
         case InstrType::Break:
             if (loop_depth_ == 0)
-                error(instr.loc, "break is not allowed outside a loop");
+                error(instr.loc, "break нельзя за пределами цикла");
             break;
 
         case InstrType::Continue:
             if (loop_depth_ == 0)
-                error(instr.loc, "continue is not allowed outside a loop");
+                error(instr.loc, "continue нельзя за пределами цикла");
             break;
 
         case InstrType::Block: {
@@ -438,9 +537,11 @@ TypeInfo SemanticAnalyzer::analyze_expr(const Expr& expr) {
             TypeInfo first = analyze_expr(*n.elements[0]);
             for (std::size_t i = 1; i < n.elements.size(); ++i) {
                 TypeInfo cur = analyze_expr(*n.elements[i]);
-                if (!first.is_unknown() && !cur.is_unknown() && !same_type(first, cur))
+                // [Доп A.1.7] Разрешаем смешанные int/float элементы через can_widen
+                if (!first.is_unknown() && !cur.is_unknown() && !same_type(first, cur)
+                    && !can_widen(first, cur) && !can_widen(cur, first))
                     error(n.elements[i]->loc,
-                          "array elements must have the same type, got "
+                          "array елементы должны быть тех же типов "
                           + type_to_string(first) + " and " + type_to_string(cur));
             }
             return TypeInfo::unknown(); // без параметрических типов не несёт информации
@@ -458,7 +559,7 @@ TypeInfo SemanticAnalyzer::analyze_expr(const Expr& expr) {
 
             auto it = structs_.find(struct_name);
             if (it == structs_.end()) {
-                error(n.loc, "unknown struct type '" + n.type_name + "'");
+                error(n.loc, "неизвестный тип структуры '" + n.type_name + "'");
                 for (const auto& f : n.fields) analyze_expr(*f.value);
                 return TypeInfo::unknown();
             }
@@ -482,7 +583,8 @@ TypeInfo SemanticAnalyzer::analyze_expr(const Expr& expr) {
                         continue;
                     }
                     TypeInfo val = analyze_expr(*init.value);
-                    if (!val.is_unknown() && !same_type(field->type_info, val))
+                    if (!val.is_unknown() && !same_type(field->type_info, val)
+                        && !can_widen(val, field->type_info))
                         error(init.value->loc,
                               "field '" + init.name + "' expects "
                               + type_to_string(field->type_info)
@@ -490,6 +592,27 @@ TypeInfo SemanticAnalyzer::analyze_expr(const Expr& expr) {
                 }
             }
             return TypeInfo::struct_type(struct_name);
+        }
+
+        // [Доп A.1.11] Мета-функции sizeof / typeid / typeof
+        case ExprType::Sizeof: {
+            const auto& n = static_cast<const SizeofExpr&>(expr);
+            // Если операнд — идентификатор, являющийся именем типа, не проверяем как переменную
+            if (n.operand->type == ExprType::Identif) {
+                const std::string& nm = static_cast<const IdentifExpr&>(*n.operand).name;
+                TypeInfo t = type_from_string(nm);
+                if (!t.is_unknown() || structs_.count(nm))
+                    return TypeInfo::of(ValueType::Int64);
+            }
+            analyze_expr(*n.operand);
+            return TypeInfo::of(ValueType::Int64);
+        }
+
+        case ExprType::Typeid:
+        case ExprType::Typeof: {
+            const auto& n = static_cast<const TypeidExpr&>(expr);
+            analyze_expr(*n.operand);
+            return TypeInfo::of(ValueType::String);
         }
     }
     return TypeInfo::unknown();
@@ -512,6 +635,64 @@ TypeInfo SemanticAnalyzer::analyze_binary(const BinaryExpr& expr) {
         }
     }
 
+    // [Доп A.2.11] Пользовательский оператор для struct-типов
+    if (lhs.base == ValueType::Struct || rhs.base == ValueType::Struct) {
+        std::string op_sym = token_kind_to_op_string(expr.op);
+        if (!op_sym.empty()) {
+            auto it = functions_.find("operator" + op_sym);
+            if (it != functions_.end()) {
+                std::vector<TypeInfo> arg_types = {lhs, rhs};
+                const auto& overloads = it->second;
+
+                auto total_rank = [&](const FunctionSymbol& sym) -> int {
+                    if (sym.param_types.size() != 2) return 10001;
+                    int tot = 0;
+                    for (int i = 0; i < 2; ++i) {
+                        int r = conversion_rank(arg_types[i], sym.param_types[i]);
+                        if (r >= 10000) return 10001;
+                        tot += r;
+                    }
+                    return tot;
+                };
+
+                int min_rank = 10001;
+                for (const auto& sym : overloads) {
+                    int r = total_rank(sym);
+                    if (r < min_rank) min_rank = r;
+                }
+                const FunctionSymbol* best = nullptr;
+                int cnt = 0;
+                for (const auto& sym : overloads)
+                    if (total_rank(sym) == min_rank) { best = &sym; ++cnt; }
+
+                if (min_rank < 10001 && cnt == 1) return best->return_type;
+                if (cnt > 1) {
+                    error(expr.loc, "ambiguous operator '" + op_sym + "'");
+                    return TypeInfo::unknown();
+                }
+            }
+        }
+        error(expr.loc, "нет оператора '" + token_kind_to_op_string(expr.op)
+                        + "' определено для типов операндов "
+                        + type_to_string(lhs) + " and " + type_to_string(rhs));
+        return TypeInfo::unknown();
+    }
+
+    switch (expr.op) {
+        // [Доп A.1.8] Битовые бинарные операции (только int)
+        case TokenKind::Ampersand:
+        case TokenKind::Pipe:
+        case TokenKind::Caret:
+        case TokenKind::LessLess:
+        case TokenKind::GreaterGreater:
+            if (is_integer(lhs.base) && is_integer(rhs.base))
+                return TypeInfo::of(lhs.base);
+            error(expr.loc, "Побитовый оператор требует целочисленных операндов., got "
+                            + type_to_string(lhs) + " and " + type_to_string(rhs));
+            return TypeInfo::unknown();
+        default: break;
+    }
+
     switch (expr.op) {
         // Арифметика
         case TokenKind::Plus:
@@ -521,49 +702,59 @@ TypeInfo SemanticAnalyzer::analyze_binary(const BinaryExpr& expr) {
         case TokenKind::Minus:
         case TokenKind::Star:
         case TokenKind::Slash:
-        case TokenKind::Percent:
-            if (is_integer(lhs.base) && is_integer(rhs.base))
-                return TypeInfo::of(lhs.base);
+        case TokenKind::Percent: {
+            // [Доп A.1.7] Нормализуем bool → int64 для арифметики
+            TypeInfo l = (lhs.base == ValueType::Bool) ? TypeInfo::of(ValueType::Int64) : lhs;
+            TypeInfo r = (rhs.base == ValueType::Bool) ? TypeInfo::of(ValueType::Int64) : rhs;
+            if (is_integer(l.base) && is_integer(r.base))
+                return TypeInfo::of(l.base);
             if (expr.op != TokenKind::Percent &&
-                lhs.base == ValueType::Float64 && rhs.base == ValueType::Float64)
+                l.base == ValueType::Float64 && r.base == ValueType::Float64)
                 return TypeInfo::of(ValueType::Float64);
-            error(expr.loc, "arithmetic operator requires numeric operands of the same type"
+            if (expr.op != TokenKind::Percent && (can_widen(l, r) || can_widen(r, l)))
+                return TypeInfo::of(ValueType::Float64);
+            error(expr.loc, "арифеметические операторы требуют одного типа"
                             ", got " + type_to_string(lhs) + " and " + type_to_string(rhs));
             return TypeInfo::unknown();
+        }
 
         // Равенство
         case TokenKind::EqualEqual:
         case TokenKind::BangEqual:
-            if (!same_type(lhs, rhs))
+            if (!same_type(lhs, rhs) && !can_widen(lhs, rhs) && !can_widen(rhs, lhs))
                 error(expr.loc,
-                      "equality comparison requires operands of the same type, got "
-                      + type_to_string(lhs) + " and " + type_to_string(rhs));
+                      "для сравнения нужны одни типы "
+                      + type_to_string(lhs) + " и " + type_to_string(rhs));
             return TypeInfo::of(ValueType::Bool);
 
-        // Порядковые сравнения
+        // Порядковые сравнения [Доп A.1.7: bool нормализуется → int64]
         case TokenKind::Less:
         case TokenKind::LessEqual:
         case TokenKind::Greater:
-        case TokenKind::GreaterEqual:
-            if ((is_integer(lhs.base) && is_integer(rhs.base)) ||
-                (lhs.base == ValueType::Float64 && rhs.base == ValueType::Float64))
+        case TokenKind::GreaterEqual: {
+            TypeInfo l = (lhs.base == ValueType::Bool) ? TypeInfo::of(ValueType::Int64) : lhs;
+            TypeInfo r = (rhs.base == ValueType::Bool) ? TypeInfo::of(ValueType::Int64) : rhs;
+            if ((is_integer(l.base) && is_integer(r.base)) ||
+                (l.base == ValueType::Float64 && r.base == ValueType::Float64) ||
+                can_widen(l, r) || can_widen(r, l))
                 return TypeInfo::of(ValueType::Bool);
-            error(expr.loc, "comparison requires numeric operands of the same type, got "
-                            + type_to_string(lhs) + " and " + type_to_string(rhs));
+            error(expr.loc, "для сравнения требуются операнды одного типа "
+                            + type_to_string(lhs) + " и " + type_to_string(rhs));
             return TypeInfo::unknown();
+        }
 
         // Логика
         case TokenKind::KwAnd:
         case TokenKind::KwOr:
             if (lhs.base != ValueType::Bool || rhs.base != ValueType::Bool) {
-                error(expr.loc, "logical operator requires bool operands, got "
+                error(expr.loc, "для логических операторов нужно логические операнды "
                                 + type_to_string(lhs) + " and " + type_to_string(rhs));
                 return TypeInfo::unknown();
             }
             return TypeInfo::of(ValueType::Bool);
 
         default:
-            error(expr.loc, "unsupported binary operator");
+            error(expr.loc, "неподдерживаемый бинарный оператор");
             return TypeInfo::unknown();
     }
 }
@@ -588,12 +779,20 @@ TypeInfo SemanticAnalyzer::analyze_unary(const UnaryExpr& expr) {
             }
             return TypeInfo::of(ValueType::Bool);
 
+        case TokenKind::Tilde:
+            if (operand.is_unknown())        return TypeInfo::unknown();
+            if (is_integer(operand.base))    return TypeInfo::of(operand.base);
+            error(expr.loc, "operator '~' requires integer operand, got "
+                            + type_to_string(operand));
+            return TypeInfo::unknown();
+
         default:
             error(expr.loc, "unsupported unary operator");
             return TypeInfo::unknown();
     }
 }
 
+// [Доп A.2.9 + A.3.1] Разрешение перегрузок функций с неявными конверсиями
 TypeInfo SemanticAnalyzer::analyze_call(const CallExpr& expr) {
     auto it = functions_.find(expr.callee);
     if (it == functions_.end()) {
@@ -602,30 +801,50 @@ TypeInfo SemanticAnalyzer::analyze_call(const CallExpr& expr) {
         return TypeInfo::unknown();
     }
 
-    const FunctionSymbol& fn = it->second;
+    // Вычисляем типы аргументов
+    std::vector<TypeInfo> arg_types;
+    arg_types.reserve(expr.args.size());
+    for (const auto& arg : expr.args)
+        arg_types.push_back(analyze_expr(*arg));
 
-    if (expr.args.size() != fn.param_types.size()) {
-        error(expr.loc, "function '" + expr.callee + "' expects "
-                        + std::to_string(fn.param_types.size())
-                        + " argument(s), got "
-                        + std::to_string(expr.args.size()));
-        for (const auto& arg : expr.args) analyze_expr(*arg);
-        return fn.return_type;
-    }
+    const auto& overloads = it->second;
 
-    for (std::size_t i = 0; i < expr.args.size(); ++i) {
-        TypeInfo arg_type = analyze_expr(*expr.args[i]);
-        const TypeInfo& expected = fn.param_types[i];
-        if (!expected.is_unknown() && !arg_type.is_unknown() &&
-            !same_type(expected, arg_type)) {
-            error(expr.args[i]->loc,
-                  "argument " + std::to_string(i + 1)
-                  + " of '" + expr.callee + "' expects "
-                  + type_to_string(expected)
-                  + ", got " + type_to_string(arg_type));
+    // Суммарный ранг конверсии для данной перегрузки (10001 = несовместима)
+    auto total_rank = [&](const FunctionSymbol& sym) -> int {
+        if (sym.param_types.size() != arg_types.size()) return 10001;
+        int total = 0;
+        for (std::size_t i = 0; i < arg_types.size(); ++i) {
+            int r = conversion_rank(arg_types[i], sym.param_types[i]);
+            if (r >= 10000) return 10001;
+            total += r;
         }
+        return total;
+    };
+
+    // Минимальный ранг среди всех перегрузок
+    int min_rank = 10001;
+    for (const auto& sym : overloads) {
+        int r = total_rank(sym);
+        if (r < min_rank) min_rank = r;
     }
-    return fn.return_type;
+
+    if (min_rank >= 10001) {
+        error(expr.loc, "no matching overload of '" + expr.callee + "' for given argument types");
+        return TypeInfo::unknown();
+    }
+
+    // Подсчёт кандидатов с минимальным рангом (для обнаружения неоднозначности)
+    const FunctionSymbol* best = nullptr;
+    int best_count = 0;
+    for (const auto& sym : overloads)
+        if (total_rank(sym) == min_rank) { best = &sym; ++best_count; }
+
+    if (best_count > 1) {
+        error(expr.loc, "ambiguous call to overloaded function '" + expr.callee + "'");
+        return TypeInfo::unknown();
+    }
+
+    return best->return_type;
 }
 
 // ── L-value ───────────────────────────────────────────────────────────────────

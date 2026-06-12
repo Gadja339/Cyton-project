@@ -68,13 +68,18 @@ public:
 
     bool analyze(const Program& program);
 
+    // REPL: инициализация один раз + пошаговый анализ без сброса состояния
+    void init_repl();
+    bool analyze_chunk(const Program& program);
+
 private:
     std::string filename_;
-    bool        had_error_ = false;
+    bool        had_error_  = false;
+    bool        repl_mode_  = false;
 
     // таблицы символов
-    std::vector<std::unordered_map<std::string, Symbol>> scopes_;
-    std::unordered_map<std::string, FunctionSymbol>      functions_;
+    std::vector<std::unordered_map<std::string, Symbol>>        scopes_;
+    std::unordered_map<std::string, std::vector<FunctionSymbol>> functions_;
     std::unordered_map<std::string, StructSymbol>        structs_;
     std::unordered_map<std::string, std::string>         type_aliases_;
 

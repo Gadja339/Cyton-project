@@ -18,6 +18,10 @@ public:
 
     int run(const Program& program);
 
+    // REPL: инициализация один раз + пошаговое выполнение
+    void init_repl();
+    int  exec_chunk(const Program& program);
+
 private:
     struct ArrayValue;
     struct StructValue;
@@ -75,11 +79,12 @@ private:
     std::string filename_;
 
     bool had_runtime_error_ = false;
-    bool stopped_ = false;
-    int exit_code_ = 0;
+    bool stopped_           = false;
+    bool repl_mode_         = false;
+    int  exit_code_         = 0;
 
-    std::vector<std::unordered_map<std::string, RuntimeVar>> scopes_;
-    std::unordered_map<std::string, const FunctionDecl*> functions_;
+    std::vector<std::unordered_map<std::string, RuntimeVar>>            scopes_;
+    std::unordered_map<std::string, std::vector<const FunctionDecl*>> functions_;
 
 private:
     void runtime_error(Location loc, const std::string& message);

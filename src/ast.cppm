@@ -24,6 +24,9 @@ export enum class ExprType {
     Cast,
     ArrayLit,
     StructLit,
+    Sizeof,
+    Typeid,
+    Typeof,
 };
 
 export enum class InstrType {
@@ -149,6 +152,27 @@ export struct CastExpr : Expr {
         : Expr(ExprType::Cast, loc),
           expr(std::move(expr)),
           target_type(std::move(target_type)) {}
+};
+
+// sizeof(type_or_expr) → int64
+export struct SizeofExpr : Expr {
+    std::unique_ptr<Expr> operand;
+    SizeofExpr(std::unique_ptr<Expr> operand, Location loc)
+        : Expr(ExprType::Sizeof, loc), operand(std::move(operand)) {}
+};
+
+// typeid(expr) → string: runtime type name
+export struct TypeidExpr : Expr {
+    std::unique_ptr<Expr> operand;
+    TypeidExpr(std::unique_ptr<Expr> operand, Location loc)
+        : Expr(ExprType::Typeid, loc), operand(std::move(operand)) {}
+};
+
+// typeof(expr) → string: static type name
+export struct TypeofExpr : Expr {
+    std::unique_ptr<Expr> operand;
+    TypeofExpr(std::unique_ptr<Expr> operand, Location loc)
+        : Expr(ExprType::Typeof, loc), operand(std::move(operand)) {}
 };
 
 export struct ArrayLitExpr : Expr {
